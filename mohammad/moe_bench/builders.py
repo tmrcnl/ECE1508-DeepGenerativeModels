@@ -75,16 +75,44 @@ def build_moe(num_experts=4, routing="top1", aux_loss_coef=0.05):
     return model
 
 
-def build_aag(num_chunks=8, num_options=4, aux_loss_coef=0.05, pretrained_init=True):
+def build_aag(num_chunks=8, num_options=4, aux_loss_coef=0.05, pretrained_init=True,
+              intermediate_dim=None, preserve_init=True, activation="gelu_new"):
     model = _base_model()
     for block in model.transformer.h:
+        original = block.mlp if pretrained_init else None
+        kwargs = {}
+        if original is None:
+            # No pretrained MLP to read dimensions from, so state them.
+            kwargs["hidden_dim"] = model.config.n_embd
+            kwargs["intermediate_dim"] = intermediate_dim or (4 * model.config.n_embd)
         block.mlp = AAGChunkMoELayer(
-            original_mlp=block.mlp if pretrained_init else None,
+            original_mlp=original,
             num_chunks=num_chunks,
             num_options=num_options,
             aux_loss_coef=aux_loss_coef,
+            preserve_init=preserve_init,
+            activation=activation,
+            **kwargs,
         )
     return model
+
+
+def build_cole_chunkmoe():
+    """Cole's ChunkMoE exactly as he trained it, for loading checkpoint-1120.
+
+    Deliberately *not* using my fixes -- random init, no gate normalisation,
+    plain erf GELU, and his 2992-wide intermediate. Applying my changes here
+    would mean scoring a model he never trained. Confirmed against the
+    checkpoint: c_fc.chunk_weights is [8, 4, 374, 768], c_proj is [8, 4, 96, 2992].
+    """
+    return build_aag(
+        num_chunks=8,
+        num_options=4,
+        pretrained_init=False,
+        intermediate_dim=2992,
+        preserve_init=False,
+        activation="gelu",
+    )
 
 
 # --------------------------------------------------------------------------
@@ -131,6 +159,26 @@ def _registry():
         )
     )
 
+    # Teammates' models, built to match their checkpoints exactly. These are
+    # evaluated from saved weights, never trained here.
+    variants.append(
+        Variant(
+            "cole-chunkmoe", "ChunkMoE 8x4 (Cole, trained)",
+            build_cole_chunkmoe, "aag",
+            "Cole's checkpoint-1120: 8 chunks, random init, no aux loss.",
+            meta={"num_chunks": 8, "num_options": 4, "pretrained_init": False,
+                  "author": "Cole", "needs_checkpoint": True},
+        )
+    )
+    variants.append(
+        Variant(
+            "tamara-moe-top1", "MoE top-1 (Tamara, trained)",
+            lambda: build_moe(routing="top1"), "moe",
+            "Tamara's gpt2-moe-alpaca checkpoint, full Alpaca.",
+            meta={"author": "Tamara", "needs_checkpoint": True},
+        )
+    )
+
     return {v.name: v for v in variants}
 
 
@@ -141,7 +189,15 @@ VARIANT_SETS = {
     "smoke": ["gpt2-dense", "aag-c2"],
     "core": ["gpt2-dense", "moe-top1", "moe-soft", "aag-c1", "aag-c8"],
     "scaling": ["aag-c1", "aag-c2", "aag-c4", "aag-c8", "aag-c16"],
+    # Head-to-head against the team's actual trained weights. Every entry here
+    # except the dense reference is loaded from a checkpoint, not trained.
+    "headtohead": ["gpt2-dense", "tamara-moe-top1", "cole-chunkmoe", "aag-c8"],
     "all": list(VARIANTS),
+}
+
+# Variants that must be loaded from saved weights rather than trained here.
+CHECKPOINT_VARIANTS = {
+    name for name, v in VARIANTS.items() if v.meta.get("needs_checkpoint")
 }
 
 

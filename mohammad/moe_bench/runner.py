@@ -45,7 +45,8 @@ def environment():
 
 
 def run_variant(name, tokenizer, train_ds, eval_ds, device, args_factory,
-                do_train=True, checkpoint=None, gradient_checkpointing=False):
+                do_train=True, checkpoint=None, gradient_checkpointing=False,
+                save_dir=None):
     """Build, optionally train, then evaluate a single variant."""
     variant = builders.VARIANTS[name]
     print(f"\n{'=' * 70}\n{variant.label}  [{name}]\n{'=' * 70}", flush=True)
@@ -55,8 +56,21 @@ def run_variant(name, tokenizer, train_ds, eval_ds, device, args_factory,
 
     if checkpoint:
         load_info = builders.load_checkpoint(model, checkpoint, device=str(device))
-        print(f"  loaded checkpoint: {len(load_info['missing'])} missing, "
-              f"{len(load_info['unexpected'])} unexpected keys")
+        n_missing = len(load_info["missing"])
+        n_total = len(list(model.state_dict()))
+        print(f"  loaded checkpoint: {n_missing}/{n_total} keys missing, "
+              f"{len(load_info['unexpected'])} unexpected")
+
+        # A checkpoint that only partly matches means the architecture is wrong,
+        # and the un-matched weights stay at their random initialisation. Scoring
+        # that and calling it someone's trained model would be worse than useless.
+        if n_missing > 0.05 * n_total:
+            raise RuntimeError(
+                f"{name}: checkpoint matched only {n_total - n_missing}/{n_total} "
+                f"keys. The architecture does not match the saved weights.\n"
+                f"  first missing: {load_info['missing'][:4]}\n"
+                f"  first unexpected: {load_info['unexpected'][:4]}"
+            )
 
     capacity = metrics.capacity_report(model)
     print(f"  stored MLP params : {capacity['mlp_stored_params']:,}")
@@ -66,6 +80,7 @@ def run_variant(name, tokenizer, train_ds, eval_ds, device, args_factory,
     model.to(device)
 
     train_metrics = {}
+    saved_to = None
     if do_train:
         train_metrics = train.train_variant(
             model,
@@ -74,6 +89,16 @@ def run_variant(name, tokenizer, train_ds, eval_ds, device, args_factory,
             gradient_checkpointing=gradient_checkpointing,
         )
         print(f"  train loss: {train_metrics.get('train_loss')}")
+
+        if save_dir:
+            # Written before evaluation on purpose: a crash in the metrics must
+            # not cost hours of training.
+            target = Path(save_dir) / name
+            target.mkdir(parents=True, exist_ok=True)
+            model.save_pretrained(target, safe_serialization=True)
+            tokenizer.save_pretrained(target)
+            saved_to = str(target)
+            print(f"  saved weights -> {saved_to}")
 
     quality = metrics.evaluate_perplexity(model, eval_ds, device)
     health = metrics.routing_health(quality.pop("_routing_counts"))
@@ -109,6 +134,7 @@ def run_variant(name, tokenizer, train_ds, eval_ds, device, args_factory,
         "samples": samples,
         "category_routing": heatmap,
         "wall_clock_s": time.perf_counter() - started,
+        "weights": saved_to or checkpoint,
     }
 
     del model
@@ -131,8 +157,16 @@ def main(argv=None):
     parser.add_argument("--lr", type=float, default=5e-5)
     parser.add_argument("--no-train", action="store_true",
                         help="evaluate without fine-tuning")
+    parser.add_argument("--checkpoints", default="",
+                        help="comma-separated variant=path pairs. A variant with "
+                             "a checkpoint is loaded from those weights and never "
+                             "trained, e.g. cole-chunkmoe=./checkpoint-1120")
     parser.add_argument("--gradient-checkpointing", action="store_true",
                         help="trade speed for memory on small GPUs")
+    parser.add_argument("--save-models", action="store_true",
+                        help="keep the trained weights under <out>/models/<variant>. "
+                             "~1.2 GB per variant. Without this the weights are "
+                             "discarded once a variant has been scored")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--tiny", action="store_true",
                         help="2-layer random backbone; verifies the pipeline "
@@ -147,6 +181,32 @@ def main(argv=None):
         names = builders.VARIANT_SETS[opts.variants]
     else:
         names = [n.strip() for n in opts.variants.split(",") if n.strip()]
+
+    checkpoints = {}
+    for pair in opts.checkpoints.split(","):
+        if not pair.strip():
+            continue
+        variant, _, path = pair.partition("=")
+        variant, path = variant.strip(), path.strip()
+        if not path:
+            raise SystemExit(f"--checkpoints entry {pair!r} needs the form variant=path")
+        resolved = Path(path)
+        if resolved.is_dir():
+            resolved = resolved / "model.safetensors"
+        if not resolved.exists():
+            raise SystemExit(f"checkpoint for {variant!r} not found: {resolved}")
+        checkpoints[variant] = str(resolved)
+
+    missing_ckpt = [
+        n for n in names
+        if n in builders.CHECKPOINT_VARIANTS and n not in checkpoints
+    ]
+    if missing_ckpt:
+        raise SystemExit(
+            "these variants are other people's trained models and cannot be "
+            f"built from scratch: {missing_ckpt}\n"
+            "pass their weights with --checkpoints <variant>=<path>"
+        )
 
     out_dir = Path(opts.out)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -188,11 +248,16 @@ def main(argv=None):
     }
 
     for name in names:
+        checkpoint = checkpoints.get(name)
         try:
             record = run_variant(
                 name, tokenizer, train_ds, eval_ds, device, args_factory,
-                do_train=not opts.no_train,
+                # A loaded checkpoint is already trained; training it again here
+                # would measure something nobody produced.
+                do_train=not opts.no_train and checkpoint is None,
+                checkpoint=checkpoint,
                 gradient_checkpointing=opts.gradient_checkpointing,
+                save_dir=str(out_dir / "models") if opts.save_models else None,
             )
             payload["results"].append(record)
         except torch.cuda.OutOfMemoryError as exc:
