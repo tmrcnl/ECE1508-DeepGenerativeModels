@@ -14,7 +14,25 @@ Author: Mohammad Al Dridi
 
 from dataclasses import dataclass
 
+import torch
 from datasets import load_dataset
+
+COLUMNS = ("input_ids", "attention_mask", "labels")
+
+
+def collate(features):
+    """Stack pre-padded examples into a batch of tensors.
+
+    Used instead of ``Dataset.set_format("torch")``. That path routes through
+    the datasets torch formatter, which imports ``torchvision.io.VideoReader``
+    for video columns -- an import that fails outright on torchvision builds
+    that no longer export it (Colab, as of this writing). Every example here is
+    already padded to ``max_length``, so a plain stack is all that is needed.
+    """
+    return {
+        key: torch.tensor([f[key] for f in features], dtype=torch.long)
+        for key in COLUMNS
+    }
 
 SEED = 42
 DATASET = "tatsu-lab/alpaca"
@@ -116,8 +134,7 @@ def build_splits(tokenizer, config: DataConfig, cache_dir=None):
     train = train.filter(has_targets)
     eval_ = eval_.filter(has_targets)
 
-    train.set_format("torch")
-    eval_.set_format("torch")
+    # Left in plain python format on purpose; batching goes through collate().
     return train, eval_
 
 

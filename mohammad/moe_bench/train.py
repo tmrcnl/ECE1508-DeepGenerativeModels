@@ -107,7 +107,14 @@ def train_variant(model, train_dataset, args, gradient_checkpointing=False):
         model.gradient_checkpointing_enable()
         model.config.use_cache = False
 
-    trainer = MoETrainer(model=model, args=args, train_dataset=train_dataset)
+    from .data import collate
+
+    trainer = MoETrainer(
+        model=model,
+        args=args,
+        train_dataset=train_dataset,
+        data_collator=collate,
+    )
     model.train()
     result = trainer.train()
 

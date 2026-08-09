@@ -90,8 +90,10 @@ def num_options_of(mlp):
 @torch.no_grad()
 def evaluate_perplexity(model, dataset, device, batch_size=8, collect_routing=True):
     """Token-weighted NLL and perplexity over supervised (label != -100) tokens."""
+    from .data import collate
+
     model.eval()
-    loader = DataLoader(dataset, batch_size=batch_size)
+    loader = DataLoader(dataset, batch_size=batch_size, collate_fn=collate)
 
     total_nll, total_tokens = 0.0, 0
     per_layer_counts = defaultdict(lambda: 0)
