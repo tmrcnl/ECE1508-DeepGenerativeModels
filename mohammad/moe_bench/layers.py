@@ -148,10 +148,19 @@ class ChunkLinearMoE(nn.Module):
         loss, matching the treatment of expert collapse in the team's MoE.
     """
 
+    # "fused" computes every option in one matmul and gathers the winner;
+    # "masked" loops over options and masks. Numerically identical -- verified
+    # to float32 epsilon on forward, all gradients, and gradient sparsity.
+    # Which is faster is hardware-dependent, so measure before choosing:
+    # fused wins where kernel dispatch dominates (GPU), masked wins where raw
+    # arithmetic dominates (CPU), because fused does num_options times the work.
+    DISPATCH = "fused"
+
     def __init__(self, in_features, out_features, num_chunks=8, num_options=4,
                  pretrained_weight=None, pretrained_bias=None, init_noise=0.02,
-                 preserve_init=True):
+                 preserve_init=True, dispatch=None):
         super().__init__()
+        self.dispatch = dispatch or self.DISPATCH
         if out_features % num_chunks != 0:
             raise ValueError(
                 f"out_features ({out_features}) must be divisible by "
@@ -217,12 +226,53 @@ class ChunkLinearMoE(nn.Module):
         if self.track_routing:
             self.routing_log.append(top_indices.detach().cpu())
 
-        chunk_outputs = []
+        if self.dispatch == "fused":
+            out = self._dispatch_fused(x, top_indices, n_tokens)
+        else:
+            out = self._dispatch_masked(x, top_indices, n_tokens)
+
+        gate = top_weights.unsqueeze(-1)
+        if self.preserve_init:
+            # Scaling a chunk by its router probability (~1/num_options at
+            # initialisation) would shrink the output to a quarter of the
+            # pretrained MLP's, throwing away the head start the slice
+            # initialisation just bought. Dividing by the detached value leaves
+            # the forward pass numerically untouched while still routing a
+            # gradient back to the router.
+            gate = gate / gate.detach().clamp_min(1e-9)
+
+        return (out * gate).reshape(n_tokens, self.out_features)
+
+    def _dispatch_fused(self, x, top_indices, n_tokens):
+        """Every (chunk, option) pair in one matmul, then gather the winner.
+
+        Does num_options times the arithmetic of what is strictly needed, but in
+        a single large kernel with no host synchronisation. Both the extra
+        arithmetic and the extra activation memory are out_features *
+        num_options, independent of num_chunks -- so a 16-chunk model costs
+        exactly what a 1-chunk model does.
+        """
+        all_options = F.linear(
+            x,
+            self.chunk_weights.reshape(-1, self.in_features),
+            self.chunk_biases.reshape(-1),
+        ).view(n_tokens, self.num_chunks, self.num_options, self.chunk_dim)
+
+        selection = top_indices[:, :, None, None].expand(
+            n_tokens, self.num_chunks, 1, self.chunk_dim
+        )
+        return all_options.gather(2, selection).squeeze(2)
+
+    def _dispatch_masked(self, x, top_indices, n_tokens):
+        """Only the arithmetic that is needed, at the cost of many small kernels.
+
+        num_chunks * num_options matmuls per layer, each preceded by a
+        `mask.any()` that synchronises the device against Python.
+        """
+        chunks = []
         for c in range(self.num_chunks):
             idx_c = top_indices[:, c]
             out_c = None
-
-            # Loop over the few options rather than gathering per token.
             for o in range(self.num_options):
                 mask = idx_c == o
                 if not mask.any():
@@ -231,30 +281,19 @@ class ChunkLinearMoE(nn.Module):
                     x[mask], self.chunk_weights[c, o], self.chunk_biases[c, o]
                 )
                 if out_c is None:
-                    # Allocated from the first result rather than from x, because
-                    # under autocast F.linear returns half while x is still float,
-                    # and an index-put requires both sides to share a dtype.
+                    # Allocated from the result, not from x: under autocast
+                    # F.linear returns half while x is float, and an index-put
+                    # requires both sides to share a dtype.
                     out_c = torch.zeros(
                         n_tokens, self.chunk_dim,
                         dtype=option_out.dtype, device=option_out.device,
                     )
                 out_c[mask] = option_out
-
-            if out_c is None:                     # no token picked this chunk
+            if out_c is None:
                 out_c = x.new_zeros(n_tokens, self.chunk_dim)
+            chunks.append(out_c)
 
-            gate = top_weights[:, c].unsqueeze(-1)
-            if self.preserve_init:
-                # Scaling the chunk by its router probability (~1/num_options at
-                # initialisation) would shrink the output to a quarter of the
-                # pretrained MLP's, throwing away the head start the slice
-                # initialisation just bought. Dividing by the detached value
-                # leaves the forward pass numerically untouched while still
-                # routing a gradient back to the router.
-                gate = gate / gate.detach().clamp_min(1e-9)
-            chunk_outputs.append(out_c * gate)
-
-        return torch.cat(chunk_outputs, dim=-1)
+        return torch.stack(chunks, dim=1)
 
 
 class AAGChunkMoELayer(nn.Module):
