@@ -61,15 +61,33 @@ def auxiliary_loss(model, attention_mask=None):
 
 
 class MoETrainer(Trainer):
-    """Adds the auxiliary loss during training and records it for logging."""
+    """Adds the auxiliary loss on top of the stock language-modelling loss.
 
-    def compute_loss(self, model, inputs, return_outputs=False, **kwargs):
-        outputs = model(**inputs)
-        loss = outputs.loss
+    The language-modelling term is delegated to ``Trainer.compute_loss`` rather
+    than recomputed. Modern Trainer normalises across a gradient-accumulation
+    window using ``num_items_in_batch``, and skips its own
+    ``loss / gradient_accumulation_steps`` when it sees that the loss was
+    computed that way. Calling ``model(**inputs)`` directly and dropping
+    ``num_items_in_batch`` therefore returned a per-batch mean that never got
+    divided -- gradients, and so the effective learning rate, came out
+    ``gradient_accumulation_steps`` times too large.
+    """
+
+    def compute_loss(self, model, inputs, return_outputs=False,
+                     num_items_in_batch=None, **kwargs):
+        loss, outputs = super().compute_loss(
+            model, inputs, return_outputs=True,
+            num_items_in_batch=num_items_in_batch, **kwargs
+        )
 
         if model.training:
             aux = auxiliary_loss(model, inputs.get("attention_mask"))
             if torch.is_tensor(aux):
+                # The LM term above is normalised over the whole accumulation
+                # window; the auxiliary term is per micro-batch, so divide it by
+                # the same factor or it would be weighted N times too heavily.
+                accum = max(getattr(self.args, "gradient_accumulation_steps", 1), 1)
+                aux = aux / accum
                 self._last_aux = float(aux.detach())
                 loss = loss + aux
 
