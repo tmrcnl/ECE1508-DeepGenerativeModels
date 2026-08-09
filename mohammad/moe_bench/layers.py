@@ -79,16 +79,28 @@ class GPT2MoELayer(nn.Module):
             # metrics.py treats both as "one selection axis per token".
             self.routing_log.append(top1_indices.detach().cpu())
 
-        out = torch.zeros_like(flat)
         if self.routing == "soft":
+            out = torch.zeros_like(flat)
             for e in range(self.num_experts):
                 out += self.experts[e](flat) * router_probs[:, e].unsqueeze(-1)
         else:
             top1_weights = router_probs.gather(1, top1_indices.unsqueeze(-1))
+            out = None
             for e in range(self.num_experts):
                 mask = top1_indices == e
-                if mask.any():
-                    out[mask] = self.experts[e](flat[mask]) * top1_weights[mask]
+                if not mask.any():
+                    continue
+                expert_out = self.experts[e](flat[mask]) * top1_weights[mask]
+                if out is None:
+                    # Under autocast the expert returns half/bfloat16 while
+                    # `flat` is still float, and an index-put needs both sides
+                    # to share a dtype -- so allocate from the result.
+                    out = torch.zeros(
+                        flat.shape, dtype=expert_out.dtype, device=expert_out.device
+                    )
+                out[mask] = expert_out
+            if out is None:
+                out = torch.zeros_like(flat)
 
         return out.view(orig_shape)
 
@@ -208,15 +220,28 @@ class ChunkLinearMoE(nn.Module):
         chunk_outputs = []
         for c in range(self.num_chunks):
             idx_c = top_indices[:, c]
-            out_c = x.new_zeros(n_tokens, self.chunk_dim)
+            out_c = None
 
             # Loop over the few options rather than gathering per token.
             for o in range(self.num_options):
                 mask = idx_c == o
-                if mask.any():
-                    out_c[mask] = F.linear(
-                        x[mask], self.chunk_weights[c, o], self.chunk_biases[c, o]
+                if not mask.any():
+                    continue
+                option_out = F.linear(
+                    x[mask], self.chunk_weights[c, o], self.chunk_biases[c, o]
+                )
+                if out_c is None:
+                    # Allocated from the first result rather than from x, because
+                    # under autocast F.linear returns half while x is still float,
+                    # and an index-put requires both sides to share a dtype.
+                    out_c = torch.zeros(
+                        n_tokens, self.chunk_dim,
+                        dtype=option_out.dtype, device=option_out.device,
                     )
+                out_c[mask] = option_out
+
+            if out_c is None:                     # no token picked this chunk
+                out_c = x.new_zeros(n_tokens, self.chunk_dim)
 
             gate = top_weights[:, c].unsqueeze(-1)
             if self.preserve_init:
