@@ -1,0 +1,15 @@
+# ECE1508 project dependencies.
+#
+# Google Colab already provides all of these. This file documents the versions
+# the reported results were produced with, and lets the notebooks be run
+# outside Colab if a suitable GPU is available.
+
+torch>=2.1
+transformers>=4.45
+datasets>=2.19
+accelerate>=0.30
+safetensors>=0.4
+
+numpy>=1.24
+pandas>=2.0
+matplotlib>=3.7
