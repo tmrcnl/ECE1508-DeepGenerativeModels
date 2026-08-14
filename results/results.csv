@@ -1,0 +1,6 @@
+Model,Owner,Trained on,PPL (alpaca),PPL (dolly),Stored MLP,Active/token,Compute,Configs,Routing H,tok/s
+GPT-2 (no fine-tuning),reference,--,11.67,21.96,56.7M,56.7M,1.00x,1e0.0,--,102.9
+MoE top-1 (4 experts),Tamara,alpaca-cleaned,7.23,16.08,226.7M,56.7M,1.00x,1e7.2,0.971,56.3
+MoE soft routing (NAM),Tamara,alpaca,7.98,15.16,226.7M,226.7M,4.00x,1e7.2,0.993,42.6
+MoE + category conditioning,Tamara,alpaca-cleaned,6.91,16.1,226.7M,56.7M,1.00x,1e7.2,0.97,53.6
+AAG (8 chunks x 4 options),Mohammad,alpaca,7.82,15.08,226.7M,56.7M,1.00x,1e115.6,0.999,69.5

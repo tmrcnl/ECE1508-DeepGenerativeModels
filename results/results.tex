@@ -1,0 +1,11 @@
+\begin{tabular}{lllrrlllllr}
+\toprule
+Model & Owner & Trained on & PPL (alpaca) & PPL (dolly) & Stored MLP & Active/token & Compute & Configs & Routing H & tok/s \\
+\midrule
+GPT-2 (no fine-tuning) & reference & -- & 11.670000 & 21.960000 & 56.7M & 56.7M & 1.00x & 1e0.0 & -- & 102.900000 \\
+MoE top-1 (4 experts) & Tamara & alpaca-cleaned & 7.230000 & 16.080000 & 226.7M & 56.7M & 1.00x & 1e7.2 & 0.971000 & 56.300000 \\
+MoE soft routing (NAM) & Tamara & alpaca & 7.980000 & 15.160000 & 226.7M & 226.7M & 4.00x & 1e7.2 & 0.993000 & 42.600000 \\
+MoE + category conditioning & Tamara & alpaca-cleaned & 6.910000 & 16.100000 & 226.7M & 56.7M & 1.00x & 1e7.2 & 0.970000 & 53.600000 \\
+AAG (8 chunks x 4 options) & Mohammad & alpaca & 7.820000 & 15.080000 & 226.7M & 56.7M & 1.00x & 1e115.6 & 0.999000 & 69.500000 \\
+\bottomrule
+\end{tabular}
